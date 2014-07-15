@@ -76,7 +76,7 @@ instance (MonadBaseControl IO m, MonadIO m, MonadLogger m) => PersistBackend (Db
   insert_ v = insert_' v
   insertBy u v = H.insertBy renderConfig queryRaw' True u v
   insertByAll v = H.insertByAll renderConfig queryRaw' True v
-  replace k v = H.replace renderConfig queryRaw' executeRaw' (insertIntoConstructorTable False) k v
+  replace k v = H.replace renderConfig queryRaw' executeRaw' (insertSingleIntoConstructorTable False) k v
   replaceBy k v = H.replaceBy renderConfig executeRaw' k v
   select options = H.select renderConfig queryRaw' preColumns "" options
   selectAll = H.selectAll renderConfig queryRaw'
@@ -175,7 +175,7 @@ insert' v = do
   liftM fst $ if isSimple (constructors e)
     then do
       let constr = head $ constructors e
-      let RenderS query vals' = insertIntoConstructorTable True False (tableName escapeS e constr) constr (tail vals)
+      let RenderS query vals' = insertIntoConstructorTable True False (tableName escapeS e constr) constr [tail vals]
       case constrAutoKeyName constr of
         Nothing -> executeRaw' query (vals' []) >> pureFromPersistValue []
         Just _  -> do
@@ -187,9 +187,26 @@ insert' v = do
       let constr = constructors e !! constructorNum
       let query = "INSERT INTO " <> mainTableName escapeS e <> "(discr)VALUES(?)RETURNING(id)"
       rowid <- queryRaw' query (take 1 vals) getKey
-      let RenderS cQuery vals' = insertIntoConstructorTable False True (tableName escapeS e constr) constr (rowid:tail vals)
+      let RenderS cQuery vals' = insertIntoConstructorTable False True (tableName escapeS e constr) constr [rowid:tail vals]
       executeRaw' cQuery (vals' [])
       pureFromPersistValue [rowid]
+
+insertMany :: (PersistEntity v, MonadBaseControl IO m, MonadIO m, MonadLogger m) => [v] -> DbPersist Postgresql m [AutoKey v]
+insertMany v = do
+  -- constructor number and the rest of the field values
+  vals <- mapM (toEntityPersistValues') v
+  let e = entityDef proxy v
+  let constructorNum = fromPrimitivePersistValue proxy (head (head vals))
+
+  let constr = head $ constructors e
+  let RenderS query vals' = insertIntoConstructorTable True False (tableName escapeS e constr) constr (map tail vals)
+  liftM (map fst) $ case constrAutoKeyName constr of
+    Nothing -> executeRaw' query (vals' []) >> mapM pureFromPersistValue []
+    Just _  -> do
+      x <- queryRaw' query (vals' []) id
+      case x of
+        Just xs -> mapM pureFromPersistValue xs
+        Nothing -> mapM pureFromPersistValue []
 
 insert_' :: (PersistEntity v, MonadBaseControl IO m, MonadIO m, MonadLogger m) => v -> DbPersist Postgresql m ()
 insert_' v = do
@@ -201,27 +218,47 @@ insert_' v = do
   if isSimple (constructors e)
     then do
       let constr = head $ constructors e
-      let RenderS query vals' = insertIntoConstructorTable False False (tableName escapeS e constr) constr (tail vals)
+      let RenderS query vals' = insertIntoConstructorTable False False (tableName escapeS e constr) constr [tail vals]
       executeRaw' query (vals' [])
     else do
       let constr = constructors e !! constructorNum
       let query = "INSERT INTO " <> mainTableName escapeS e <> "(discr)VALUES(?)RETURNING(id)"
       rowid <- queryRaw' query (take 1 vals) getKey
-      let RenderS cQuery vals' = insertIntoConstructorTable False True (tableName escapeS e constr) constr (rowid:tail vals)
+      let RenderS cQuery vals' = insertIntoConstructorTable False True (tableName escapeS e constr) constr ([rowid:tail vals])
       executeRaw' cQuery (vals' [])
 
-insertIntoConstructorTable :: Bool -> Bool -> Utf8 -> ConstructorDef -> [PersistValue] -> RenderS db r
-insertIntoConstructorTable withRet withId tName c vals = RenderS query vals' where
-  query = "INSERT INTO " <> tName <> columnsValues <> returning
-  (fields, returning) = case constrAutoKeyName c of
-    Just idName -> (fields', returning') where
-      fields' = if withId then (idName, dbType proxy (0 :: Int64)):constrParams c else constrParams c
-      returning' = if withRet then " RETURNING(" <> escapeS (fromString idName) <> ")" else mempty
-    _           -> (constrParams c, mempty)
-  columnsValues = case foldr (flatten escapeS) [] fields of
-    [] -> " DEFAULT VALUES"
-    xs -> "(" <> commasJoin xs <> ") VALUES(" <> placeholders <> ")"
-  RenderS placeholders vals' = commasJoin $ map renderPersistValue vals
+
+insertSingleIntoConstructorTable withRet withId tName c vals = insertIntoConstructorTable withRet withId tName c [vals]
+
+insertIntoConstructorTable :: Bool -> Bool -> Utf8 -> ConstructorDef -> [[PersistValue]] -> RenderS db r
+insertIntoConstructorTable withRet withId tName c valss = RenderS query vals'
+  where
+    query = "INSERT INTO " <> tName <> columnsValues <> returning
+
+
+    -------------------------------------------------------------------------------
+    (fields, returning) = case constrAutoKeyName c of
+      Just idName -> 
+        let fields' = if withId then (idName, dbType proxy (0 :: Int64)):constrParams c else constrParams c
+            returning' = if withRet then " RETURNING(" <> escapeS (fromString idName) <> ")" else mempty
+        in  (fields', returning')
+      _           -> (constrParams c, mempty)
+
+
+    -------------------------------------------------------------------------------
+    RenderS columnsValues vals' = case foldr (flatten escapeS) [] fields of
+      [] -> " DEFAULT VALUES"
+      xs -> "(" <> commasJoin ( map packRenderS xs) <> ") VALUES " <> commasJoin (map mkRow valss)
+
+
+    -------------------------------------------------------------------------------
+    mkRow vals = RenderS ("(" <> placeholders <> ")") vals'
+      where
+        RenderS placeholders vals' = commasJoin $ map renderPersistValue vals
+
+
+packRenderS x = RenderS x id
+
 
 insertList' :: forall m a.(MonadBaseControl IO m, MonadIO m, MonadLogger m, PersistField a) => [a] -> DbPersist Postgresql m Int64
 insertList' (l :: [a]) = do
@@ -238,7 +275,7 @@ insertList' (l :: [a]) = do
       go _ [] = return ()
   go 0 l
   return $ fromPrimitivePersistValue proxy k
-  
+
 getList' :: forall m a.(MonadBaseControl IO m, MonadIO m, MonadLogger m, PersistField a) => Int64 -> DbPersist Postgresql m [a]
 getList' k = do
   let mainName = "List" <> delim' <> delim' <> fromString (persistName (undefined :: a))
